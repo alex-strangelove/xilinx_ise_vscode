@@ -10,6 +10,9 @@ ISE_VM_NAME = "ISE_14.7_VIRTUAL_MACHINE"
 ISE_VM_HOSTNAME = "ise"
 ISE_VM_USER = "ise"
 ISE_VM_PASSWORD = "xilinx"
+PROJECTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
+SHARED_FOLDER_NAME = "projects" 
+VM_MOUNT_POINT = "/home/ise/projects"
 
 # Initialize start time for logging
 start_time = time.time()
@@ -115,7 +118,6 @@ class ListVMsCommand(Command):
             context.set(key, vm_list)
             return vm_list
         else:
-            # Handle empty results gracefully
             if self.running_only:
                 log("No running VMs found", "yellow")
                 context.set("running_vms", [])
@@ -425,29 +427,242 @@ class VerifySSHConnectionCommand(Command):
             log(f"SSH public key authentication failed: {e}", "red")
             return False
 
+class ShutdownISEVMCommand(Command):
+    """Command to shutdown the ISE VM."""
+    
+    def __init__(self):
+        super().__init__("Shutdown ISE VM")
+    
+    def execute(self, context: Context):
+        # Check if VM is running
+        running_vms = context.get("running_vms", [])
+        if ISE_VM_NAME not in running_vms:
+            log(f"ISE VM '{ISE_VM_NAME}' is not running", "yellow")
+            context.set("ise_vm_running", False)
+            return True
+        
+        log("Graceful shutdown timed out, forcing power off...", "yellow")
+        subprocess.run([VBOXMANAGE_EXE, "controlvm", ISE_VM_NAME, "poweroff"], 
+                      capture_output=True, text=True, check=True)
+        
+        # Wait for VM to shutdown
+        log("Waiting for VM to shutdown...", "cyan")
+        timeout = 60
+        elapsed = 0
+        check_interval = 3
+        
+        while elapsed < timeout:
+            # Check if VM is still running
+            result = subprocess.run([VBOXMANAGE_EXE, "list", "runningvms"], 
+                                   capture_output=True, text=True, check=True)
+            
+            if not result.stdout.strip() or ISE_VM_NAME not in result.stdout:
+                log(f"ISE VM '{ISE_VM_NAME}' shutdown successfully", "green")
+                context.set("ise_vm_running", False)
+                return True
+            
+            time.sleep(check_interval)
+            elapsed += check_interval
+            log(f"VM still running, waiting... ({elapsed}s/{timeout}s)", "yellow")
+        
+        # Give VirtualBox a moment to process the poweroff
+        time.sleep(5)
+        
+        context.set("ise_vm_running", False)
+        log(f"ISE VM '{ISE_VM_NAME}' powered off", "green")
+        return True
+
+class SetupSharedFolderCommand(Command):
+    """Command to setup VirtualBox shared folder for projects."""
+    
+    def __init__(self):
+        super().__init__("Setup shared folder")
+    
+    def execute(self, context: Context):
+        # Create projects directory if it doesn't exist
+        if not os.path.exists(PROJECTS_DIR):
+            try:
+                log(f"Projects directory not found, creating: {PROJECTS_DIR}", "yellow")
+                os.makedirs(PROJECTS_DIR, exist_ok=True)
+            except Exception as e:
+                raise RuntimeError(f"Failed to create projects directory: {e}")
+        
+        # Ensure VM is shutdown for shared folder modifications
+        running_vms = context.get("running_vms", [])
+        if ISE_VM_NAME in running_vms:
+            raise RuntimeError("VM must be shutdown to modify shared folders")
+        
+        # Remove existing shared folder if it exists
+        try:
+            log(f"Removing existing shared folder '{SHARED_FOLDER_NAME}' if it exists...", "cyan")
+            subprocess.run([VBOXMANAGE_EXE, "sharedfolder", "remove", ISE_VM_NAME, 
+                           "--name", SHARED_FOLDER_NAME], 
+                          capture_output=True, text=True, check=False)
+        except Exception:
+            # Ignore errors - folder might not exist
+            pass
+        
+        # Add new shared folder
+        log(f"Adding shared folder: {PROJECTS_DIR}", "cyan")
+        subprocess.run([VBOXMANAGE_EXE, "sharedfolder", "add", ISE_VM_NAME,
+                       "--name", SHARED_FOLDER_NAME, "--hostpath", PROJECTS_DIR,
+                       "--automount"], 
+                      capture_output=True, text=True, check=True)
+        
+        log(f"Shared folder '{SHARED_FOLDER_NAME}' created: {PROJECTS_DIR} -> {VM_MOUNT_POINT}", "green")
+        context.set("shared_folder_setup", True)
+        return True
+
+class MountSharedFolderCommand(Command):
+    """Command to mount shared folder inside the ISE VM."""
+    
+    def __init__(self):
+        super().__init__("Mount shared folder in VM")
+    
+    def execute(self, context: Context):
+        vm_ip = context.get("ise_vm_ip")
+        if not vm_ip:
+            raise RuntimeError("VM IP not available")
+        
+        # Connect to VM
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            # Try with SSH keys first if configured
+            if context.get("ssh_verified"):
+                client.connect(vm_ip, username=ISE_VM_USER,
+                              disabled_algorithms={'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']})
+            else:
+                # Fall back to password authentication
+                client.connect(vm_ip, username=ISE_VM_USER, password=ISE_VM_PASSWORD,
+                              disabled_algorithms={'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']})
+        except Exception as e:
+            log(f"SSH connection failed: {e}", "red")
+            raise
+        
+        # Create mount point and add user to vboxsf group for permissions
+        commands = [
+            f"echo '{ISE_VM_PASSWORD}' | sudo -S mkdir -p {VM_MOUNT_POINT}",
+            f"echo '{ISE_VM_PASSWORD}' | sudo -S chown {ISE_VM_USER}:{ISE_VM_USER} {VM_MOUNT_POINT}",
+            f"echo '{ISE_VM_PASSWORD}' | sudo -S usermod -a -G vboxsf {ISE_VM_USER}"
+        ]
+        
+        for cmd in commands:
+            stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+            error = stderr.read().decode().strip()
+            if error and "already a member" not in error and "Password:" not in error:
+                log(f"Warning executing command: {error}", "yellow")
+        
+        # Mount the shared folder
+        unmount_cmd = f"echo '{ISE_VM_PASSWORD}' | sudo -S umount {VM_MOUNT_POINT} 2>/dev/null || true"
+        client.exec_command(unmount_cmd, get_pty=True)
+        
+        mount_cmd = f"echo '{ISE_VM_PASSWORD}' | sudo -S mount -t vboxsf -o uid={ISE_VM_USER},gid={ISE_VM_USER} {SHARED_FOLDER_NAME} {VM_MOUNT_POINT}"
+        stdin, stdout, stderr = client.exec_command(mount_cmd, get_pty=True)
+        error = stderr.read().decode().strip()
+        if error and "already mounted" not in error and "Password:" not in error:
+            client.close()
+            raise RuntimeError(f"Failed to mount shared folder: {error}")
+        
+        # Verify the mount worked by listing contents
+        stdin, stdout, stderr = client.exec_command(f"ls -la {VM_MOUNT_POINT}")
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+        
+        if error:
+            client.close()
+            raise RuntimeError(f"Failed to verify mount: {error}")
+        
+        log(f"Mount verification successful:", "green")
+        log(f"Contents of {VM_MOUNT_POINT}:", "cyan")
+        for line in output.split('\n')[:5]:  # Show first 5 lines
+            log(f"  {line}", "yellow")
+        
+        client.close()
+        log(f"Shared folder mounted at {VM_MOUNT_POINT}", "green")
+        context.set("shared_folder_mounted", True)
+        return True
+
+class SetupPersistentMountCommand(Command):
+    """Command to setup persistent mount in /etc/fstab."""
+    
+    def __init__(self):
+        super().__init__("Setup persistent mount")
+    
+    def execute(self, context: Context):
+        vm_ip = context.get("ise_vm_ip")
+        if not vm_ip:
+            raise RuntimeError("VM IP not available")
+        
+        # Connect to VM
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            # Try with SSH keys first if configured
+            if context.get("ssh_verified"):
+                client.connect(vm_ip, username=ISE_VM_USER,
+                              disabled_algorithms={'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']})
+            else:
+                # Fall back to password authentication
+                client.connect(vm_ip, username=ISE_VM_USER, password=ISE_VM_PASSWORD,
+                              disabled_algorithms={'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']})
+        except Exception as e:
+            log(f"SSH connection failed: {e}", "red")
+            raise
+        
+        # Set up persistent mount in /etc/fstab
+        fstab_entry = f"{SHARED_FOLDER_NAME} {VM_MOUNT_POINT} vboxsf uid={ISE_VM_USER},gid={ISE_VM_USER},auto 0 0"
+        
+        # Remove any existing entry
+        remove_cmd = f"echo '{ISE_VM_PASSWORD}' | sudo -S sed -i '/{SHARED_FOLDER_NAME}/d' /etc/fstab"
+        client.exec_command(remove_cmd, get_pty=True)
+        
+        # Add new entry
+        add_cmd = f"echo '{fstab_entry}' | echo '{ISE_VM_PASSWORD}' | sudo -S tee -a /etc/fstab"
+        stdin, stdout, stderr = client.exec_command(add_cmd, get_pty=True)
+        error = stderr.read().decode().strip()
+        if error and "Password:" not in error:
+            log(f"Warning updating fstab: {error}", "yellow")
+        
+        client.close()
+        log("Persistent mount configured in /etc/fstab", "green")
+        context.set("persistent_mount_setup", True)
+        return True
+
 def main():
-    log_job_start("Configure ISE VM SSH access")
+    log_job_start("Configure ISE VM SSH access and shared folders")
     
     try:
         context = Context()
         executor = CommandExecutor()
         
-        # Define the command sequence
-        commands = [
+        # Initial setup - check VM and shutdown if running
+        initial_commands = [
             CheckVBoxManageCommand(),
-            ListVMsCommand(running_only=False),  # Load all VMs first
+            ListVMsCommand(running_only=False),  # Check all VMs
             CheckISEVMExistsCommand(),
             ListVMsCommand(running_only=True),   # Check running VMs
+            ShutdownISEVMCommand()               # Shutdown if running
+        ]
+        
+        executor.execute_commands(initial_commands, context)
+        
+        # Setup shared folder while VM is off
+        executor.execute_command(SetupSharedFolderCommand(), context)
+        
+        # Start VM and setup SSH access
+        vm_setup_commands = [
             StartISEVMCommand(),
             GetVMIPCommand(),
             WaitForSSHCommand(),
             UpdateSSHConfigCommand()
         ]
         
-        # Execute main commands
-        executor.execute_commands(commands, context)
+        executor.execute_commands(vm_setup_commands, context)
         
-        # Try to setup SSH keys (optional)
+        # Setup SSH keys and verify SSH connection
         try:
             ssh_commands = [
                 SetupSSHKeysCommand(),
@@ -459,15 +674,30 @@ def main():
             log(f"SSH key setup failed: {e}", "red")
             log("You can manually setup keys using ssh-copy-id", "yellow")
         
+        # Mount shared folder and setup persistence
+        try:
+            mount_commands = [
+                MountSharedFolderCommand(),
+                SetupPersistentMountCommand()
+            ]
+            executor.execute_commands(mount_commands, context)
+            log(f"Shared folder setup complete. Your projects are available at: {VM_MOUNT_POINT}", "green")
+        except Exception as e:
+            log(f"Shared folder mount failed: {e}", "red")
+            log("You can manually mount the shared folder", "yellow")
+        
+        # Final status report
         if context.get("ssh_verified"):
             log("You can now connect to the ISE VM using: ssh ise", "green")
-            log_job_success("Configure ISE VM SSH access")
+            if context.get("shared_folder_mounted"):
+                log(f"Your projects are available at: {VM_MOUNT_POINT}", "green")
+            log_job_success("Configure ISE VM SSH access and shared folders")
         else:
-            log("SSH connection verification failed. Please check your setup.", "red")
-            log_job_failed("Configure ISE VM SSH access", "SSH verification failed")
+            log("Configuration completed with issues. Check the logs.", "yellow")
+            log_job_failed("Configure ISE VM SSH access and shared folders", "SSH verification failed")
             
     except Exception as e:
-        log_job_failed("Configure ISE VM SSH access", str(e))
+        log_job_failed("Configure ISE VM SSH access and shared folders", str(e))
         raise
 
 if __name__ == "__main__":
